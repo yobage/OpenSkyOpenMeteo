@@ -15,6 +15,9 @@ dependencies = [
     "tenacity>=8.3,<9.0",
     "psycopg[binary]>=3.1,<4.0",
     "sqlparse>=0.5,<0.6",
+    "streamlit>=1.36,<2.0",
+    "pydeck>=0.9,<1.0",
+    "pandas>=2.2,<3.0",
 ]
 
 [project.optional-dependencies]

@@ -13,7 +13,7 @@ querying, and a Streamlit dashboard.
 - [x] Phase 1 — Ingestion → RabbitMQ
 - [x] Phase 2 — Consumer → enrichment → PostgreSQL
 - [x] Phase 3 — AI layer
-- [ ] Phase 4 — Streamlit dashboard
+- [x] Phase 4 — Streamlit dashboard
 - [ ] Phase 5 — Packaging (docker-compose, CI, docs)
 
 ## Phase 1: Ingestion
@@ -32,9 +32,9 @@ cp .env.example .env   # optionally fill in OpenSky client_id/client_secret
 docker compose up --build
 ```
 
-RabbitMQ management UI: http://localhost:15672 (guest/guest). Watch the
-`flighthub-ingestion` container logs for throughput (`Published N flight(s)
-in ...s (... msg/s)`).
+RabbitMQ management UI: http://localhost:15672 (guest/guest). Dashboard:
+http://localhost:8501. Watch the `flighthub-ingestion` container logs for
+throughput (`Published N flight(s) in ...s (... msg/s)`).
 
 ## Phase 2: Consumer, enrichment, storage
 
@@ -61,6 +61,23 @@ no code change) offering three things the dashboard calls into:
   rapid climb/descent, possible holding patterns) are found with deterministic
   thresholds/geometry, not the LLM; the LLM only explains flags after the
   fact.
+
+## Phase 4: Dashboard
+
+`src/dashboard/app.py` is a Streamlit app at http://localhost:8501:
+
+- A map of currently tracked flights (`pydeck`), colored on a blue-to-red
+  gradient by altitude, with a tooltip showing callsign, altitude, velocity,
+  and weather at that position.
+- A flight + weather data table, and both auto-refresh on
+  `DASHBOARD_REFRESH_SECONDS` via `st.fragment` — this part just re-reads
+  Postgres, so refreshing it costs nothing.
+- An AI situational-summary panel and an anomaly-detection panel (both call
+  into `src/ai`), plus a free-text question box wired to text-to-SQL. These
+  are button-triggered rather than auto-refreshing, so they don't burn
+  free-tier LLM quota on every tick.
+- If no `GEMINI_API_KEY`/`GROQ_API_KEY` is set, the map/table still work; the
+  AI panels show a note instead of failing.
 
 ### Local dev / tests
 
