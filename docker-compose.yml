@@ -14,6 +14,27 @@ services:
     env_file:
       - .env
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: flighthub-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flighthub}
+      POSTGRES_USER: ${POSTGRES_USER:-flighthub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flighthub}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flighthub} -d ${POSTGRES_DB:-flighthub}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    env_file:
+      - .env
+
   ingestion:
     build:
       context: .
@@ -27,3 +48,23 @@ services:
       rabbitmq:
         condition: service_healthy
     restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+      dockerfile: src/consumer/Dockerfile
+    container_name: flighthub-consumer
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      POSTGRES_HOST: postgres
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

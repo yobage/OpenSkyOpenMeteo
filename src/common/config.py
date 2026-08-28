@@ -36,8 +36,32 @@ class Settings(BaseSettings):
     rabbitmq_routing_key: str = "flights.raw"
     rabbitmq_queue: str = "flights.raw"
 
+    # --- PostgreSQL ---
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_db: str = "flighthub"
+    postgres_user: str = "flighthub"
+    postgres_password: str = "flighthub"
+
+    # --- Open-Meteo (weather enrichment) ---
+    open_meteo_base_url: str = "https://api.open-meteo.com/v1/forecast"
+    # Flights are bucketed onto a lat/lon grid of this size (degrees) so
+    # nearby aircraft share a single cached weather lookup.
+    weather_grid_size_deg: float = 0.25
+    weather_cache_ttl_seconds: float = 600.0
+
+    # --- Consumer ---
+    consumer_prefetch_count: int = 20
+
     # --- Logging ---
     log_level: str = "INFO"
+
+    @property
+    def postgres_dsn(self) -> str:
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
 
 
 def get_settings() -> Settings:

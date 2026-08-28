@@ -97,3 +97,78 @@ class FlightMessage(BaseModel):
 
     state: StateVector
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class WeatherReading(BaseModel):
+    """Current weather at a location, from Open-Meteo's `current` block."""
+
+    temperature_c: float | None = None
+    wind_speed_kmh: float | None = None
+    wind_direction_deg: float | None = None
+    weather_code: int | None = None
+    observed_at: str | None = None  # ISO 8601 string as returned by Open-Meteo
+
+
+def _unix_to_datetime(ts: int | None) -> datetime | None:
+    return datetime.fromtimestamp(ts, tz=UTC) if ts is not None else None
+
+
+class EnrichedFlight(BaseModel):
+    """A flight state normalized and enriched with weather, ready for storage.
+
+    Mirrors the `flights` / `flight_history` table columns 1:1.
+    """
+
+    icao24: str
+    callsign: str | None = None
+    origin_country: str
+    longitude: float | None = None
+    latitude: float | None = None
+    baro_altitude: float | None = None
+    geo_altitude: float | None = None
+    on_ground: bool = False
+    velocity: float | None = None
+    true_track: float | None = None
+    vertical_rate: float | None = None
+    squawk: str | None = None
+    spi: bool = False
+    position_source: int | None = None
+    category: int | None = None
+    time_position: datetime | None = None
+    last_contact: datetime | None = None
+    weather_temperature_c: float | None = None
+    weather_wind_speed_kmh: float | None = None
+    weather_wind_direction_deg: float | None = None
+    weather_code: int | None = None
+    fetched_at: datetime
+
+    @classmethod
+    def from_flight_message(
+        cls, message: FlightMessage, weather: WeatherReading | None
+    ) -> EnrichedFlight:
+        """Combine a raw FlightMessage with an (optional) weather reading."""
+        state = message.state
+        return cls(
+            icao24=state.icao24,
+            callsign=state.callsign,
+            origin_country=state.origin_country,
+            longitude=state.longitude,
+            latitude=state.latitude,
+            baro_altitude=state.baro_altitude,
+            geo_altitude=state.geo_altitude,
+            on_ground=state.on_ground,
+            velocity=state.velocity,
+            true_track=state.true_track,
+            vertical_rate=state.vertical_rate,
+            squawk=state.squawk,
+            spi=state.spi,
+            position_source=state.position_source,
+            category=state.category,
+            time_position=_unix_to_datetime(state.time_position),
+            last_contact=_unix_to_datetime(state.last_contact),
+            weather_temperature_c=weather.temperature_c if weather else None,
+            weather_wind_speed_kmh=weather.wind_speed_kmh if weather else None,
+            weather_wind_direction_deg=weather.wind_direction_deg if weather else None,
+            weather_code=weather.weather_code if weather else None,
+            fetched_at=message.fetched_at,
+        )
