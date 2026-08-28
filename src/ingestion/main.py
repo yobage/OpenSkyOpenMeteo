@@ -13,6 +13,7 @@ from types import FrameType
 
 import httpx
 from common.config import get_settings
+from common.heartbeat import touch_heartbeat
 from common.logging import configure_logging
 from common.models import FlightMessage
 
@@ -100,6 +101,7 @@ def run() -> None:
                 logger.info(
                     "Published %d flight(s) in %.2fs (%.1f msg/s)", len(states), elapsed, rate
                 )
+                touch_heartbeat()
             except Exception:
                 logger.exception("Error during poll/publish cycle; will retry next interval")
 

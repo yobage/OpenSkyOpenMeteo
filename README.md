@@ -1,89 +1,142 @@
 # Real-Time Flight Data Integration Hub with AI
 
-Portfolio project: live flight positions (OpenSky Network) and weather
-(Open-Meteo) integrated in real time through a message queue, normalized into
-PostgreSQL, with an AI layer for situational summaries and natural-language
-querying, and a Streamlit dashboard.
+[![CI](https://github.com/yobage/OpenSkyOpenMeteo/actions/workflows/ci.yml/badge.svg)](https://github.com/yobage/OpenSkyOpenMeteo/actions/workflows/ci.yml)
 
-> Work in progress, built phase by phase. This README will gain a full
-> architecture diagram, setup guide, and credential instructions in Phase 5.
+Two live public data sources — flight positions and weather — integrated in
+real time through a message queue, normalized into PostgreSQL, with an AI
+layer for natural-language situational summaries, free-text querying, and
+anomaly detection, plus a live Streamlit dashboard. Runs entirely on free
+tiers with `docker compose up`.
 
-## Status
+## Why this project
 
-- [x] Phase 1 — Ingestion → RabbitMQ
-- [x] Phase 2 — Consumer → enrichment → PostgreSQL
-- [x] Phase 3 — AI layer
-- [x] Phase 4 — Streamlit dashboard
-- [ ] Phase 5 — Packaging (docker-compose, CI, docs)
+This mirrors a common shape of real-world enterprise integration work: pull
+from multiple live external sources, decouple ingestion from processing with
+a message broker (the same pattern JMS/EMS/IBM MQ solve in enterprise
+stacks), transform/normalize heterogeneous JSON into a relational schema, and
+serve it back out — here with a modern AI layer on top instead of a
+traditional BI report. The interesting engineering is in the seams: OAuth2
+token lifecycle management, rate-limit backoff, caching to avoid hammering a
+downstream API, exactly the kind of upsert-vs-append schema design real
+systems need, and — since an LLM is now in the request path — treating
+LLM-generated SQL as untrusted input rather than trusting the model's own
+claim that a query is safe.
 
-## Phase 1: Ingestion
+## Architecture
 
-`src/ingestion` authenticates to OpenSky (OAuth2 client-credentials, with
-automatic token refresh; falls back to anonymous access if no credentials are
-configured), polls `/states/all` for a bounding box around Israel every
-`POLL_INTERVAL_SECONDS`, parses the index-based state-vector arrays into a
-typed `StateVector` model, and publishes each aircraft as a JSON message to a
-durable RabbitMQ exchange.
+```mermaid
+flowchart LR
+    subgraph Sources["Live data sources"]
+        OS["OpenSky Network<br/>/states/all"]
+        OM["Open-Meteo<br/>/forecast"]
+    end
 
-### Run it
+    OS -->|"poll every 12s<br/>OAuth2 bearer token"| ING["Ingestion service"]
+    ING -->|"publish JSON<br/>per aircraft"| MQ[("RabbitMQ<br/>flights_exchange")]
+    MQ -->|consume| CON["Consumer service"]
+    OM -->|"weather lookup<br/>grid-cell cached"| CON
+    CON -->|upsert + append history| PG[("PostgreSQL<br/>flights / flight_history")]
+
+    PG --> AI["AI layer<br/>summary · text-to-SQL · anomalies"]
+    LLM["Gemini or Groq<br/>(LLM_PROVIDER)"] <--> AI
+    PG --> DASH["Streamlit dashboard"]
+    AI --> DASH
+```
+
+| Stage | What it does |
+|---|---|
+| **Ingestion** (`src/ingestion`) | OAuth2 client-credentials auth to OpenSky with automatic token refresh (falls back to anonymous access if no credentials are set), polls `/states/all` for a bounding box, parses the index-based state-vector arrays into typed models, publishes to RabbitMQ. |
+| **RabbitMQ** | Durable direct exchange decoupling ingestion from processing — either side can be down or slow without losing data or blocking the other. |
+| **Consumer** (`src/consumer`) | Enriches each flight with current weather from Open-Meteo (cached per lat/lon grid cell), normalizes into a unified schema, upserts a current snapshot and appends to history in PostgreSQL. |
+| **PostgreSQL** (`db/init.sql`) | `flights` (current snapshot, keyed by `icao24`) + `flight_history` (append-only), with geo/trajectory indexes. |
+| **AI layer** (`src/ai`) | Provider-agnostic (`LLM_PROVIDER=gemini\|groq`, no code change to switch). Situational summaries narrate deterministically-computed stats. Text-to-SQL generates a query, then validates it with `sqlparse` before ever executing it — SELECT-only, no writes/DDL/stacked statements/catalog access. Anomaly detection (low altitude, rapid vertical rate, holding-pattern geometry) is rule-based; the LLM only explains findings afterward. |
+| **Dashboard** (`src/dashboard`) | Streamlit app: live map colored by altitude, weather table, AI summary/anomaly panels, and a free-text Q&A box — all wired to the pieces above. |
+
+## Getting started
+
+Requires [Docker](https://docs.docker.com/get-docker/) with Compose. Nothing
+else to install — everything runs in containers.
 
 ```bash
-cp .env.example .env   # optionally fill in OpenSky client_id/client_secret
+git clone https://github.com/yobage/OpenSkyOpenMeteo.git
+cd OpenSkyOpenMeteo
+cp .env.example .env
 docker compose up --build
 ```
 
-RabbitMQ management UI: http://localhost:15672 (guest/guest). Dashboard:
-http://localhost:8501. Watch the `flighthub-ingestion` container logs for
-throughput (`Published N flight(s) in ...s (... msg/s)`).
+Then open:
 
-## Phase 2: Consumer, enrichment, storage
+- **Dashboard** — http://localhost:8501
+- **RabbitMQ management UI** — http://localhost:15672 (`guest`/`guest`)
 
-`src/consumer` reads flight messages from RabbitMQ, looks up current weather
-from Open-Meteo for each position (cached per lat/lon grid cell to avoid
-redundant calls for nearby aircraft), and upserts the normalized result into
-PostgreSQL: a `flights` snapshot table (one row per icao24) plus an
-append-only `flight_history` table. Schema and indexes: `db/init.sql`.
+The stack works out of the box with anonymous OpenSky access and no LLM key
+(the dashboard's map/table still work; AI panels show a note instead of
+failing). For the full experience, fill in `.env`:
 
-## Phase 3: AI layer
+### Free OpenSky credentials (optional, higher rate limits)
 
-`src/ai` is a provider-agnostic module (switch providers with `LLM_PROVIDER`,
-no code change) offering three things the dashboard calls into:
+1. Create a free account at [opensky-network.org](https://opensky-network.org/index.php?option=com_users&view=registration).
+2. Go to [My OpenSky → API Client](https://opensky-network.org/my-opensky) and create an API client to get a `client_id` / `client_secret`.
+3. Put them in `.env` as `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`.
 
-- **Situational summaries** (`summary.py`) — stats are computed
-  deterministically in Python, then handed to the LLM to narrate in plain
-  English, so it can't invent numbers.
-- **Text-to-SQL** (`text_to_sql.py`) — turns a free-text question into SQL
-  against the flights schema. Every generated query is parsed with `sqlparse`
-  and rejected unless it's a single, plain `SELECT` with no writes, DDL,
-  catalog access, or stacked statements — the LLM's own claim that a query is
-  safe is never trusted.
-- **Anomaly detection** (`anomalies.py`) — flags (unusually low altitude,
-  rapid climb/descent, possible holding patterns) are found with deterministic
-  thresholds/geometry, not the LLM; the LLM only explains flags after the
-  fact.
+### Free LLM credentials (required for the AI panels)
 
-## Phase 4: Dashboard
+Pick one — both have generous free tiers and need no credit card:
 
-`src/dashboard/app.py` is a Streamlit app at http://localhost:8501:
+- **Gemini**: get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey), set `GEMINI_API_KEY`.
+- **Groq**: get a key at [console.groq.com/keys](https://console.groq.com/keys), set `GROQ_API_KEY`.
 
-- A map of currently tracked flights (`pydeck`), colored on a blue-to-red
-  gradient by altitude, with a tooltip showing callsign, altitude, velocity,
-  and weather at that position.
-- A flight + weather data table, and both auto-refresh on
-  `DASHBOARD_REFRESH_SECONDS` via `st.fragment` — this part just re-reads
-  Postgres, so refreshing it costs nothing.
-- An AI situational-summary panel and an anomaly-detection panel (both call
-  into `src/ai`), plus a free-text question box wired to text-to-SQL. These
-  are button-triggered rather than auto-refreshing, so they don't burn
-  free-tier LLM quota on every tick.
-- If no `GEMINI_API_KEY`/`GROQ_API_KEY` is set, the map/table still work; the
-  AI panels show a note instead of failing.
+Set `LLM_PROVIDER` to whichever you used — switching providers later is a
+one-line env change, no code change.
 
-### Local dev / tests
+## Project structure
+
+```
+├── db/init.sql              # schema: flights, flight_history, indexes
+├── src/
+│   ├── common/               # shared config, models, logging, heartbeat
+│   ├── ingestion/             # OpenSky auth + polling -> RabbitMQ
+│   ├── consumer/              # RabbitMQ -> weather enrichment -> Postgres
+│   ├── ai/                   # LLM provider abstraction, summary, text-to-SQL, anomalies
+│   └── dashboard/             # Streamlit app
+├── tests/                    # state-vector parsing, SQL safety, weather cache, heartbeat
+├── docker-compose.yml         # rabbitmq, postgres, ingestion, consumer, dashboard
+└── .github/workflows/ci.yml   # ruff + pytest on push
+```
+
+## Local development
 
 ```bash
-python -m venv .venv && source .venv/Scripts/activate  # or .venv\Scripts\Activate.ps1 on Windows
+python -m venv .venv
+source .venv/Scripts/activate   # .venv\Scripts\Activate.ps1 on Windows PowerShell
 pip install -e ".[dev]"
 pytest
 ruff check .
 ```
+
+Each service can also run standalone against infra started with
+`docker compose up rabbitmq postgres`:
+
+```bash
+PYTHONPATH=src python -m ingestion.main
+PYTHONPATH=src python -m consumer.main
+PYTHONPATH=src streamlit run src/dashboard/app.py
+```
+
+## Design notes
+
+A few decisions worth calling out to a reviewer:
+
+- **SQL safety is enforced in code, not by prompting.** The LLM's claim that
+  a generated query is read-only is never trusted; `ai/text_to_sql.py` parses
+  every query with `sqlparse` and rejects anything but a single plain
+  `SELECT` (see `tests/test_sql_safety.py` for the attack surface covered).
+- **Weather is grid-cached, not per-flight.** Nearby aircraft share one
+  Open-Meteo lookup per coarse lat/lon cell (`consumer/weather.py`), so a busy
+  poll cycle costs a handful of HTTP calls, not one per aircraft.
+- **Deterministic first, LLM second.** Situational-summary stats and anomaly
+  detection are computed in plain Python; the LLM only narrates/explains
+  already-computed facts, so it can't invent numbers that weren't given to it.
+- **Workers healthcheck via heartbeat file, not a port.** Ingestion and
+  consumer have no HTTP endpoint, so each touches `/tmp/healthy` on every
+  successful work cycle; the container `HEALTHCHECK` just checks its mtime.

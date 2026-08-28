@@ -15,6 +15,7 @@ from types import FrameType
 import httpx
 import pika
 from common.config import Settings, get_settings
+from common.heartbeat import touch_heartbeat
 from common.logging import configure_logging
 from common.models import EnrichedFlight, FlightMessage
 from pika.exceptions import AMQPConnectionError
@@ -26,6 +27,14 @@ from consumer.weather import WeatherClient
 logger = logging.getLogger(__name__)
 
 _LOG_EVERY_N_MESSAGES = 20
+# Touched on a timer (not per-message) so the healthcheck stays green even
+# when the queue is quiet, and only goes stale if the consumer actually hangs.
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _schedule_heartbeat(connection: pika.BlockingConnection, interval: float) -> None:
+    touch_heartbeat()
+    connection.call_later(interval, lambda: _schedule_heartbeat(connection, interval))
 
 
 @retry(
@@ -110,6 +119,8 @@ def run() -> None:
 
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
+    _schedule_heartbeat(connection, _HEARTBEAT_INTERVAL_SECONDS)
 
     logger.info("Consumer started, waiting for messages on queue '%s'", settings.rabbitmq_queue)
     try:
