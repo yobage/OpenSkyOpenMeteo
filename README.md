@@ -11,8 +11,8 @@ querying, and a Streamlit dashboard.
 ## Status
 
 - [x] Phase 1 — Ingestion → RabbitMQ
-- [ ] Phase 2 — Consumer → enrichment → PostgreSQL
-- [ ] Phase 3 — AI layer
+- [x] Phase 2 — Consumer → enrichment → PostgreSQL
+- [x] Phase 3 — AI layer
 - [ ] Phase 4 — Streamlit dashboard
 - [ ] Phase 5 — Packaging (docker-compose, CI, docs)
 
@@ -35,6 +35,32 @@ docker compose up --build
 RabbitMQ management UI: http://localhost:15672 (guest/guest). Watch the
 `flighthub-ingestion` container logs for throughput (`Published N flight(s)
 in ...s (... msg/s)`).
+
+## Phase 2: Consumer, enrichment, storage
+
+`src/consumer` reads flight messages from RabbitMQ, looks up current weather
+from Open-Meteo for each position (cached per lat/lon grid cell to avoid
+redundant calls for nearby aircraft), and upserts the normalized result into
+PostgreSQL: a `flights` snapshot table (one row per icao24) plus an
+append-only `flight_history` table. Schema and indexes: `db/init.sql`.
+
+## Phase 3: AI layer
+
+`src/ai` is a provider-agnostic module (switch providers with `LLM_PROVIDER`,
+no code change) offering three things the dashboard calls into:
+
+- **Situational summaries** (`summary.py`) — stats are computed
+  deterministically in Python, then handed to the LLM to narrate in plain
+  English, so it can't invent numbers.
+- **Text-to-SQL** (`text_to_sql.py`) — turns a free-text question into SQL
+  against the flights schema. Every generated query is parsed with `sqlparse`
+  and rejected unless it's a single, plain `SELECT` with no writes, DDL,
+  catalog access, or stacked statements — the LLM's own claim that a query is
+  safe is never trusted.
+- **Anomaly detection** (`anomalies.py`) — flags (unusually low altitude,
+  rapid climb/descent, possible holding patterns) are found with deterministic
+  thresholds/geometry, not the LLM; the LLM only explains flags after the
+  fact.
 
 ### Local dev / tests
 

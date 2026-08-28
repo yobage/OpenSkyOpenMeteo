@@ -6,6 +6,8 @@ dashboard). Each service only reads the fields it needs.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,6 +54,13 @@ class Settings(BaseSettings):
 
     # --- Consumer ---
     consumer_prefetch_count: int = 20
+
+    # --- AI layer ---
+    llm_provider: Literal["gemini", "groq"] = "gemini"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.0-flash"
+    groq_api_key: str | None = None
+    groq_model: str = "llama-3.3-70b-versatile"
 
     # --- Logging ---
     log_level: str = "INFO"
