@@ -3,13 +3,24 @@
 Reads flight messages from RabbitMQ, enriches each with current weather from
 Open-Meteo (grid-cell cached), normalizes into EnrichedFlight, and upserts
 into PostgreSQL. Runs forever until interrupted (SIGINT/SIGTERM).
+
+Message processing (weather lookup + DB upsert) runs on a thread pool rather
+than pika's single IO thread: a blocking HTTP round-trip per uncached
+weather grid cell means one-at-a-time processing can't keep up once the
+polling bbox is large (e.g. a whole country) and covers many grid cells at
+once. `pika.BlockingConnection`/`channel` are not thread-safe, so worker
+threads never touch them directly — each schedules its ack/nack back onto
+the connection's own IO thread via `add_callback_threadsafe`.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import signal
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import FrameType
 
 import httpx
@@ -84,7 +95,50 @@ def run() -> None:
     channel = connection.channel()
     channel.basic_qos(prefetch_count=settings.consumer_prefetch_count)
 
+    executor = ThreadPoolExecutor(
+        max_workers=settings.consumer_worker_threads, thread_name_prefix="consumer-worker"
+    )
+
     state = {"processed": 0, "last_log_time": time.monotonic()}
+    state_lock = threading.Lock()
+
+    def _ack_or_nack(ch: pika.channel.Channel, delivery_tag: int, ok: bool) -> None:
+        if ok:
+            ch.basic_ack(delivery_tag=delivery_tag)
+        else:
+            ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
+
+    def _process_message(ch: pika.channel.Channel, delivery_tag: int, body: bytes) -> None:
+        """Runs on a worker thread: weather lookup + DB upsert, then schedules the ack/nack
+        back onto pika's IO thread (`ch`/`connection` are not safe to touch from here)."""
+        try:
+            message = FlightMessage.model_validate_json(body)
+            weather = weather_client.get_weather(message.state.latitude, message.state.longitude)
+            enriched = EnrichedFlight.from_flight_message(message, weather)
+            repository.upsert_flight(enriched)
+            ok = True
+        except Exception:
+            logger.exception("Failed to process message; dropping it (nack, no requeue)")
+            ok = False
+
+        connection.add_callback_threadsafe(
+            functools.partial(_ack_or_nack, ch, delivery_tag, ok)
+        )
+
+        if not ok:
+            return
+        with state_lock:
+            state["processed"] += 1
+            processed = state["processed"]
+            if processed % _LOG_EVERY_N_MESSAGES == 0:
+                now = time.monotonic()
+                elapsed = now - state["last_log_time"]
+                rate = _LOG_EVERY_N_MESSAGES / elapsed if elapsed > 0 else 0.0
+                state["last_log_time"] = now
+            else:
+                rate = None
+        if rate is not None:
+            logger.info("Processed %d messages total (%.1f msg/s)", processed, rate)
 
     def on_message(
         ch: pika.channel.Channel,
@@ -92,24 +146,7 @@ def run() -> None:
         _properties: pika.spec.BasicProperties,
         body: bytes,
     ) -> None:
-        try:
-            message = FlightMessage.model_validate_json(body)
-            weather = weather_client.get_weather(message.state.latitude, message.state.longitude)
-            enriched = EnrichedFlight.from_flight_message(message, weather)
-            repository.upsert_flight(enriched)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        except Exception:
-            logger.exception("Failed to process message; dropping it (nack, no requeue)")
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-            return
-
-        state["processed"] += 1
-        if state["processed"] % _LOG_EVERY_N_MESSAGES == 0:
-            now = time.monotonic()
-            elapsed = now - state["last_log_time"]
-            rate = _LOG_EVERY_N_MESSAGES / elapsed if elapsed > 0 else 0.0
-            logger.info("Processed %d messages total (%.1f msg/s)", state["processed"], rate)
-            state["last_log_time"] = now
+        executor.submit(_process_message, ch, method.delivery_tag, body)
 
     channel.basic_consume(queue=settings.rabbitmq_queue, on_message_callback=on_message)
 
@@ -122,10 +159,15 @@ def run() -> None:
 
     _schedule_heartbeat(connection, _HEARTBEAT_INTERVAL_SECONDS)
 
-    logger.info("Consumer started, waiting for messages on queue '%s'", settings.rabbitmq_queue)
+    logger.info(
+        "Consumer started with %d worker thread(s), waiting for messages on queue '%s'",
+        settings.consumer_worker_threads,
+        settings.rabbitmq_queue,
+    )
     try:
         channel.start_consuming()
     finally:
+        executor.shutdown(wait=True)
         connection.close()
         repository.close()
         http_client.close()

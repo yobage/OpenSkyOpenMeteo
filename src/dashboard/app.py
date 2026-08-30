@@ -13,6 +13,7 @@ auto-refreshing, so a free-tier API quota isn't burned on every tick.
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import UTC, datetime
 
 import httpx
@@ -52,6 +53,9 @@ _ALTITUDE_COLOR_STOPS: list[tuple[float, tuple[int, int, int]]] = [
 ]
 
 HISTORY_LOOKBACK_MINUTES = 20
+# A few poll cycles' worth of tolerance (default poll interval is 12s) before
+# an aircraft's last-known position is considered too stale to still be "current".
+CURRENT_SNAPSHOT_MAX_AGE_SECONDS = 90
 
 
 # Loaded once at script top level (Streamlit re-executes this whole file on
@@ -93,8 +97,20 @@ def _altitude_color(altitude_m: float | None) -> list[int]:
 
 
 def _fetch_current_flights(dsn: str) -> list[EnrichedFlight]:
+    """Return the current snapshot, excluding rows the consumer hasn't touched recently.
+
+    `flights` is upserted per aircraft and never pruned, so an aircraft that
+    left the polling bbox would otherwise linger with a stale position
+    forever. Filtering to rows updated within the last few poll cycles makes
+    "current" mean current.
+    """
     with psycopg.connect(dsn) as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT * FROM flights ORDER BY updated_at DESC")
+        cur.execute(
+            "SELECT * FROM flights "
+            "WHERE updated_at > now() - (%(seconds)s || ' seconds')::interval "
+            "ORDER BY updated_at DESC",
+            {"seconds": CURRENT_SNAPSHOT_MAX_AGE_SECONDS},
+        )
         rows = cur.fetchall()
     return [EnrichedFlight.model_validate(row) for row in rows]
 
@@ -249,14 +265,38 @@ def _render_qa_panel(provider: LLMProvider | None, dsn: str) -> None:
             return
 
         st.write(result.answer)
-        with st.expander("SQL used"):
-            st.code(result.sql, language="sql")
         st.dataframe(pd.DataFrame(result.rows), use_container_width=True)
+
+
+def _require_password(settings: Settings) -> bool:
+    """Gate the app behind DASHBOARD_PASSWORD if one is configured.
+
+    A no-op (always authenticated) when unset, so local development never
+    needs a password. Must be set before public deployment, or anyone with
+    the URL can freely burn the LLM free-tier quota via the AI panels.
+    """
+    if not settings.dashboard_password:
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("🔒 Sign in")
+    password = st.text_input("Password", type="password")
+    if st.button("Sign in") and password:
+        if secrets.compare_digest(password, settings.dashboard_password):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    return False
 
 
 def main() -> None:
     st.set_page_config(page_title="Flight Data Integration Hub", page_icon="✈️", layout="wide")
     settings = _settings
+    if not _require_password(settings):
+        st.stop()
+
     http_client = _http_client()
     provider = _get_provider(settings, http_client)
 

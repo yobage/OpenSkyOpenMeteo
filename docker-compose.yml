@@ -2,9 +2,15 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: flighthub-rabbitmq
+    # Bound to loopback only: reachable from this host (e.g. `docker exec`,
+    # or the management UI via an SSH tunnel) but never from the network —
+    # AMQP/management credentials should never be internet-reachable.
     ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # management UI (guest/guest)
+      - "127.0.0.1:5672:5672"   # AMQP
+      - "127.0.0.1:15672:15672" # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -17,8 +23,9 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: flighthub-postgres
+    # Loopback-only, same reasoning as rabbitmq above.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-flighthub}
       POSTGRES_USER: ${POSTGRES_USER:-flighthub}

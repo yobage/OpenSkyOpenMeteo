@@ -64,9 +64,33 @@ class RabbitMQPublisher:
         logger.info("RabbitMQ topology ready: exchange=%s queue=%s", self._exchange, self._queue)
 
     def publish(self, message: FlightMessage) -> None:
-        """Publish a single flight message, persisted to disk by the broker."""
+        """Publish a single flight message, persisted to disk by the broker.
+
+        Reconnects and retries once if the connection was lost since the
+        last publish (e.g. a broker-side reset) instead of failing every
+        cycle forever — `basic_publish` on a dead channel/connection raises
+        immediately rather than blocking, so this stays cheap in the common
+        case where the connection is fine.
+        """
         if self._channel is None:
             raise RuntimeError("publisher not connected; call connect() first")
+
+        if self._connection is None or self._connection.is_closed:
+            logger.warning("RabbitMQ connection was lost; reconnecting before publish")
+            self.connect()
+
+        try:
+            self._publish_once(message)
+        except (
+            pika.exceptions.AMQPConnectionError,
+            pika.exceptions.ChannelWrongStateError,
+            pika.exceptions.StreamLostError,
+        ):
+            logger.warning("Publish failed on existing connection; reconnecting and retrying once")
+            self.connect()
+            self._publish_once(message)
+
+    def _publish_once(self, message: FlightMessage) -> None:
         self._channel.basic_publish(
             exchange=self._exchange,
             routing_key=self._routing_key,

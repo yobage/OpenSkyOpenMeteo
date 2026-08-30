@@ -10,6 +10,7 @@ first startup.
 from __future__ import annotations
 
 import logging
+import threading
 
 import psycopg
 from common.models import EnrichedFlight
@@ -72,11 +73,16 @@ INSERT INTO flight_history (
 
 
 class FlightRepository:
-    """Upserts enriched flights into PostgreSQL."""
+    """Upserts enriched flights into PostgreSQL.
+
+    Called from multiple consumer worker threads sharing one connection; a
+    lock keeps each upsert-and-history-insert pair atomic and serialized.
+    """
 
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
         self._conn: psycopg.Connection | None = None
+        self._lock = threading.Lock()
 
     @retry(
         retry=retry_if_exception_type(psycopg.OperationalError),
@@ -94,10 +100,10 @@ class FlightRepository:
         if self._conn is None:
             raise RuntimeError("repository not connected; call connect() first")
         params = flight.model_dump()
-        with self._conn.cursor() as cur:
+        with self._lock, self._conn.cursor() as cur:
             cur.execute(_UPSERT_FLIGHT_SQL, params)
             cur.execute(_INSERT_HISTORY_SQL, params)
-        self._conn.commit()
+            self._conn.commit()
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:

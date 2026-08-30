@@ -5,11 +5,17 @@ polling weather once per flight per cycle would still be wasteful: many
 aircraft over Israel share roughly the same weather. We bucket each flight's
 position onto a coarse lat/lon grid and cache one reading per grid cell for
 a short TTL, so a busy poll cycle triggers only a handful of HTTP calls.
+
+The consumer calls `get_weather` from multiple worker threads (see
+`consumer/main.py`), so cache reads/writes are protected by a lock. Only the
+cache access is locked, not the HTTP call itself, so concurrent lookups for
+different (uncached) grid cells still fetch in parallel.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 
@@ -39,6 +45,7 @@ class WeatherClient:
         self._cache_ttl_seconds = cache_ttl_seconds
         self._clock = clock
         self._cache: dict[_GridKey, tuple[WeatherReading, float]] = {}
+        self._cache_lock = threading.Lock()
 
     def _grid_key(self, lat: float, lon: float) -> _GridKey:
         size = self._grid_size_deg
@@ -53,14 +60,16 @@ class WeatherClient:
             return None
 
         key = self._grid_key(lat, lon)
-        cached = self._cache.get(key)
         now = self._clock()
+        with self._cache_lock:
+            cached = self._cache.get(key)
         if cached is not None and now - cached[1] < self._cache_ttl_seconds:
             return cached[0]
 
         reading = self._fetch(key[0], key[1])
         if reading is not None:
-            self._cache[key] = (reading, now)
+            with self._cache_lock:
+                self._cache[key] = (reading, now)
         return reading
 
     def _fetch(self, lat: float, lon: float) -> WeatherReading | None:
